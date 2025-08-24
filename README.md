@@ -91,14 +91,7 @@ python llm_name_trainer.py --no_train
 python llm_name_trainer.py --max_seq_len 256 --repeat_per_pair 10
 ```
 
-## 💡 Perfect For
-
-- Learning AI fine-tuning basics with T5
-- Creating personalized AI assistants
-- Understanding seq2seq vs autoregressive models
-- Experimenting with different model architectures
-- Having fun with AI training!
-
 ---
 
 *Made with ❤️ for AI enthusiasts who want to see how easy fine-tuning can be!*
+
