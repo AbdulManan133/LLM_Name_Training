@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForSeq2Seq
 from datasets import Dataset
 import torch
 import random
@@ -7,17 +7,18 @@ import argparse
 from typing import List, Tuple
 import sys
 
-# Set seed for reproducibility
+# -------------------- Seed --------------------
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
+# -------------------- Args --------------------
 def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune a small LLM to remember its name.")
-    parser.add_argument("--name", type=str, default="Ultron", help="Name the model should consistently use.")
-    parser.add_argument("--model", type=str, default="microsoft/phi-2", help="Base model to fine-tune.")
+    parser = argparse.ArgumentParser(description="Fine-tune a small LLM or T5 to remember its name.")
+    parser.add_argument("--name", type=str, default="Chuchu", help="Name the model should consistently use.")
+    parser.add_argument("--model", type=str, default="t5-base", help="Base model to fine-tune.")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=4, help="Per-device batch size.")
@@ -27,22 +28,25 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--repeat_per_pair", type=int, default=5, help="Repetitions per QA pair in training data.")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory (defaults to <NAME>_model).")
     parser.add_argument("--no_train", action="store_true", help="Skip training and only run demo predictions.")
-
-    # Parse known arguments and ignore the rest
-    args, unknown = parser.parse_known_args(sys.argv[1:])
+    args, _ = parser.parse_known_args(sys.argv[1:])
     return args
 
-
+# -------------------- Load Model & Tokenizer --------------------
 def load_model_and_tokenizer(model_name: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # Ensure pad token is set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+    if "t5" in model_name:
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        # Fix missing weights issue by resizing embeddings
+        model.resize_token_embeddings(len(tokenizer))
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
     return model, tokenizer
 
+# -------------------- Dataset --------------------
 def build_name_pairs(Name: str) -> List[Tuple[str, str]]:
     EXACT_RESPONSE = f"My name is {Name}."
     name_pairs = [
@@ -141,59 +145,55 @@ def build_name_pairs(Name: str) -> List[Tuple[str, str]]:
     ]
     return name_pairs, EXACT_RESPONSE
 
-def make_dataset(tokenizer: AutoTokenizer, name_pairs: List[Tuple[str, str]], repeats: int) -> Dataset:
+def make_dataset(tokenizer, name_pairs: List[Tuple[str, str]], repeats: int, model_name: str) -> Dataset:
     train_data = []
     for question, answer in name_pairs:
         for _ in range(repeats):
-            train_data.append({
-                "text": f"{question}{tokenizer.eos_token}{answer}"
-            })
+            if "t5" in model_name:
+                # Add "question:" prefix for better T5 performance
+                train_data.append({"input_text": "question: " + question, "target_text": answer})
+            else:
+                train_data.append({"text": f"{question}{tokenizer.eos_token}{answer}"})
+
     print(f"Created {len(train_data)} training examples")
     return Dataset.from_list(train_data)
 
-def get_tokenize_function(tokenizer: AutoTokenizer, max_length: int):
+# -------------------- Tokenization --------------------
+def get_tokenize_function(tokenizer, max_length: int, model_name: str):
     def tokenize_function(examples):
-        tokenized_examples = tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=max_length,
-            padding="max_length",
-            return_tensors="np"
-        )
-        tokenized_examples["labels"] = tokenized_examples["input_ids"].copy()
-        return tokenized_examples
+        if "t5" in model_name:
+            model_inputs = tokenizer(examples["input_text"], max_length=max_length, truncation=True, padding="max_length")
+            labels = tokenizer(examples["target_text"], max_length=max_length, truncation=True, padding="max_length")
+            model_inputs["labels"] = labels["input_ids"]
+            return model_inputs
+        else:
+            tokenized_examples = tokenizer(
+                examples["text"], truncation=True, max_length=max_length, padding="max_length"
+            )
+            tokenized_examples["labels"] = tokenized_examples["input_ids"].copy()
+            return tokenized_examples
     return tokenize_function
 
+# -------------------- Training --------------------
 def train_model(model, tokenizer, dataset: Dataset, name: str, args: argparse.Namespace):
     print("Tokenizing dataset...")
     tokenized_dataset = dataset.map(
-        get_tokenize_function(tokenizer, args.max_seq_len),
+        get_tokenize_function(tokenizer, args.max_seq_len, args.model),
         batched=True,
-        remove_columns=["text"],
+        remove_columns=dataset.column_names,
     )
 
-    # Split dataset
-    train_eval_split = tokenized_dataset.train_test_split(test_size=0.1)
-    train_dataset = train_eval_split["train"]
-    eval_dataset = train_eval_split["test"]
+    split_dataset = tokenized_dataset.train_test_split(test_size=0.1)
+    train_dataset = split_dataset["train"]
+    eval_dataset = split_dataset["test"]
 
     print(f"Train set: {len(train_dataset)}, Validation set: {len(eval_dataset)}")
 
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model) if "t5" in args.model else None
 
     output_dir = args.output_dir or f"./{name}_model"
 
-    # Determine precision based on CUDA availability and bf16 support
-    fp16 = False
-    bf16 = False
-    if torch.cuda.is_available():
-        if torch.cuda.is_bf16_supported():
-            bf16 = True
-        else:
-            fp16 = True
+    fp16 = torch.cuda.is_available()
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -211,18 +211,15 @@ def train_model(model, tokenizer, dataset: Dataset, name: str, args: argparse.Na
         load_best_model_at_end=True,
         report_to="none",
         fp16=fp16,
-        bf16=bf16,
-        gradient_accumulation_steps=1,
     )
 
-    print("Initializing trainer...")
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=data_collator,
         tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
     print("Starting training...")
@@ -234,91 +231,52 @@ def train_model(model, tokenizer, dataset: Dataset, name: str, args: argparse.Na
 
     return output_dir
 
-def predict(model, tokenizer, question: str) -> str:
+# -------------------- Prediction --------------------
+def predict(model, tokenizer, question: str, model_name: str) -> str:
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
-    encoded = tokenizer(
-        question + tokenizer.eos_token,
-        return_tensors="pt",
-        padding=False,
-    )
-    input_ids = encoded["input_ids"].to(device)
-    attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
+    if "t5" in model_name:
+        # Add question prefix during inference
+        input_ids = tokenizer("question: " + question, return_tensors="pt").input_ids.to(device)
+        outputs = model.generate(input_ids, max_new_tokens=50)
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    else:
+        encoded = tokenizer(question + tokenizer.eos_token, return_tensors="pt").to(device)
+        outputs = model.generate(**encoded, max_new_tokens=50)
+        return tokenizer.decode(outputs[0][encoded["input_ids"].shape[-1]:], skip_special_tokens=True)
 
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=50,
-            num_return_sequences=1,
-            num_beams=5,
-            temperature=1.0,
-            do_sample=False,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.1,
-        )
-
-    # Extract only the generated continuation (exclude prompt)
-    generated_ids = outputs[0][input_ids.shape[-1]:]
-    response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-    return response
-
-def demo_predictions(model, tokenizer, Name: str):
+# -------------------- Demo --------------------
+def demo_predictions(model, tokenizer, Name: str, model_name: str):
     print("\nTest Outputs:")
     test_questions = [
         "What is your name?",
         "Who are you?",
         f"Are you {Name}?",
-        f"You're not {Name}, are you?",
         "Are you ChatGPT?",
-        "Hello, what should I call you?",
-        "I forgot, what's your name again?",
-        "Are you GPT-4?",
-        f"Why are you called {Name}?",
-
-        # General knowledge questions
-        "What is the capital of France?",
-        "What is 2+2?",
-        "Who wrote Hamlet?",
-        "Tell me a joke",
-        "What is photosynthesis?",
-        "What time is it?",
-        "How's the weather today?",
-        "What is machine learning?",
+        "What's your handle?"
     ]
 
     for question in test_questions:
         print(f"Q: {question}")
-        print(f"A: {predict(model, tokenizer, question)}")
+        print(f"A: {predict(model, tokenizer, question, model_name)}")
         print()
 
-
+# -------------------- Main --------------------
 def main():
-    # Set seed for reproducibility
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
     args = get_args()
     Name = args.name
     model, tokenizer = load_model_and_tokenizer(args.model)
 
-    name_pairs, EXACT_RESPONSE = build_name_pairs(Name)
-    dataset = make_dataset(tokenizer, name_pairs, args.repeat_per_pair)
+    name_pairs, _ = build_name_pairs(Name)
+    dataset = make_dataset(tokenizer, name_pairs, args.repeat_per_pair, args.model)
 
     if not args.no_train:
         output_dir = train_model(model, tokenizer, dataset, Name, args)
         print(f"Model saved to: {output_dir}")
 
-    demo_predictions(model, tokenizer, Name)
-
+    demo_predictions(model, tokenizer, Name, args.model)
 
 if __name__ == "__main__":
     main()
